@@ -11,6 +11,23 @@ import { VideoInfo } from './Helper';
 // User agent for requests
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
 
+// OAuth configuration
+export interface RedditOAuthConfig {
+    clientId: string;
+    clientSecret: string;
+    username?: string;
+    password?: string;
+}
+
+// OAuth token response
+export interface RedditOAuthToken {
+    access_token: string;
+    token_type: string;
+    expires_in: number;
+    scope: string;
+    expiresAt?: number; // Timestamp when the token will expire
+}
+
 export interface RedditMediaInfo {
     videoUrl: string;
     audioUrl: string | null;
@@ -21,10 +38,13 @@ export interface RedditMediaInfo {
 export class RedditDownloader {
     private tempDir: string;
     private outputDir: string;
+    private oauthConfig?: RedditOAuthConfig;
+    private currentToken?: RedditOAuthToken;
 
-    constructor(baseDir: string) {
+    constructor(baseDir: string, oauthConfig?: RedditOAuthConfig) {
         this.tempDir = join(baseDir, 'temp');
         this.outputDir = join(baseDir, 'files');
+        this.oauthConfig = oauthConfig;
 
         // Create directories if they don't exist
         if (!existsSync(this.tempDir)) {
@@ -36,12 +56,114 @@ export class RedditDownloader {
         }
     }
 
+
+    // Method to test if the current OAuth token is working
+    public async testOAuthToken(): Promise<boolean> {
+        try {
+            console.log('Testing OAuth token...');
+
+            // Get auth headers (this will fetch a token if needed)
+            const authHeaders = await this.getAuthHeaders();
+
+            // Make a simple request to the Reddit API
+            const response = await fetch('https://oauth.reddit.com/api/v1/me', {
+                headers: authHeaders
+            });
+
+            if (!response.ok) {
+                console.error(`Token test failed: ${response.status} ${response.statusText}`);
+                return false;
+            }
+
+            const data = await response.json();
+            console.log('OAuth token test successful!');
+            console.log('Authenticated as:', data.name);
+            return true;
+        } catch (error: any) {
+            console.error('OAuth token test failed:', error.message);
+            return false;
+        }
+    }
+    // Get OAuth token from Reddit
+    private async getOAuthToken(): Promise<RedditOAuthToken> {
+        if (!this.oauthConfig) {
+            throw new Error('OAuth configuration not provided');
+        }
+
+        try {
+            // Check if we have a valid token
+            if (this.currentToken && this.currentToken.expiresAt && this.currentToken.expiresAt > Date.now()) {
+                return this.currentToken;
+            }
+
+            const { clientId, clientSecret, username, password } = this.oauthConfig;
+            const authString = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+            const grantType = username && password ? 'password' : 'client_credentials';
+
+            const body = new URLSearchParams();
+            body.append('grant_type', grantType);
+
+            // Include username and password for password grant type
+            if (grantType === 'password' && username && password) {
+                body.append('username', username);
+                body.append('password', password);
+            }
+
+            const response = await fetch('https://www.reddit.com/api/v1/access_token', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Basic ${authString}`,
+                    'User-Agent': USER_AGENT,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: body.toString()
+            });
+
+            if (!response.ok) {
+                throw new Error(`OAuth token request failed: ${response.statusText} (${response.status})`);
+            }
+
+            const token = await response.json() as RedditOAuthToken;
+
+            // Calculate expiration time (adding a buffer of 60 seconds)
+            token.expiresAt = Date.now() + (token.expires_in - 60) * 1000;
+            this.currentToken = token;
+            return token;
+        } catch (error: any) {
+            throw new Error(`OAuth authentication failed: ${error.message}`);
+        }
+    }
+
+    // Get authorization header for API requests
+    private async getAuthHeaders(): Promise<Record<string, string>> {
+        const baseHeaders = {
+            'User-Agent': USER_AGENT
+        };
+
+        try {
+            // If OAuth is not configured, return base headers
+            if (!this.oauthConfig) {
+                return baseHeaders;
+            }
+
+            const token = await this.getOAuthToken();
+            return {
+                ...baseHeaders,
+                'Authorization': `${token.token_type} ${token.access_token}`
+            };
+        } catch (error) {
+            console.warn('Failed to get OAuth token, proceeding without authentication:', error);
+            return baseHeaders;
+        }
+    }
+
     // Function to download file from URL
     private async downloadFile(url: string, outputPath: string, referer = 'https://www.reddit.com/'): Promise<void> {
         try {
+            const authHeaders = await this.getAuthHeaders();
             const response = await fetch(url, {
                 headers: {
-                    'User-Agent': USER_AGENT,
+                    ...authHeaders,
                     'Referer': referer,
                     'Origin': 'https://www.reddit.com'
                 },
@@ -75,9 +197,10 @@ export class RedditDownloader {
     // Function to fetch content from URL
     private async fetchContent(url: string, referer = 'https://www.reddit.com/'): Promise<string> {
         try {
+            const authHeaders = await this.getAuthHeaders();
             const response = await fetch(url, {
                 headers: {
-                    'User-Agent': USER_AGENT,
+                    ...authHeaders,
                     'Referer': referer,
                     'Origin': 'https://www.reddit.com'
                 },
@@ -97,6 +220,47 @@ export class RedditDownloader {
     // Function to get JSON data from Reddit post URL
     private async getRedditPostJSON(url: string): Promise<any> {
         try {
+            // Extract post ID from URL for OAuth API
+            const postId = this.extractPostIdFromUrl(url);
+            if (!postId) {
+                throw new Error('Could not extract post ID from URL');
+            }
+
+            const authHeaders = await this.getAuthHeaders();
+
+            // Use OAuth endpoint instead of direct .json approach
+            const oauthUrl = `https://oauth.reddit.com/api/info?id=t3_${postId}`;
+
+            const response = await fetch(oauthUrl, {
+                headers: {
+                    ...authHeaders,
+                    'Accept': 'application/json'
+                },
+                redirect: 'follow'
+            });
+
+            if (!response.ok) {
+                // Fall back to non-OAuth if authentication fails
+                console.warn(`OAuth request failed (${response.status}), falling back to public API`);
+                return this.getRedditPostJSONFallback(url);
+            }
+
+            const data = await response.json();
+            // Transform the OAuth response format to match the expected format
+            return [{
+                data: {
+                    children: data.data.children
+                }
+            }];
+        } catch (error: any) {
+            console.warn(`OAuth request failed: ${error.message}, falling back to public API`);
+            return this.getRedditPostJSONFallback(url);
+        }
+    }
+
+    // Fallback method that uses the public API
+    private async getRedditPostJSONFallback(url: string): Promise<any> {
+        try {
             // Convert URL to JSON endpoint
             const jsonUrl = url.endsWith('/') ? `${url}.json` : `${url}/.json`;
 
@@ -115,6 +279,63 @@ export class RedditDownloader {
             return await response.json();
         } catch (error: any) {
             throw new Error(`Failed to fetch Reddit post data: ${error.message}`);
+        }
+    }
+
+    // Helper method to extract post ID from various Reddit URL formats
+    private extractPostIdFromUrl(url: string): string | null {
+        try {
+            // Handle different Reddit URL formats
+            const urlObj = new URL(url);
+
+            // Standard format: https://www.reddit.com/r/subreddit/comments/abcdef/...
+            // Short format: https://redd.it/abcdef
+
+            const pathParts = urlObj.pathname.split('/').filter(part => part.length > 0);
+
+            if (urlObj.hostname === 'redd.it') {
+                // For short URLs, the ID is the only path part
+                return pathParts[0];
+            }
+
+            // For standard URLs, find the ID which appears after "comments"
+            for (let i = 0; i < pathParts.length - 1; i++) {
+                if (pathParts[i] === 'comments') {
+                    return pathParts[i + 1];
+                }
+            }
+
+            return null;
+        } catch (error) {
+            console.error('Failed to parse Reddit URL:', error);
+            return null;
+        }
+    }
+
+    // Method to test OAuth capabilities with Reddit API
+    public async testOAuthConnection(): Promise<boolean> {
+        if (!this.oauthConfig) {
+            console.log('OAuth not configured, skipping test');
+            return false;
+        }
+
+        try {
+            const authHeaders = await this.getAuthHeaders();
+            const response = await fetch('https://oauth.reddit.com/api/v1/me', {
+                headers: authHeaders
+            });
+
+            if (!response.ok) {
+                console.error(`OAuth connection test failed: ${response.status} ${response.statusText}`);
+                return false;
+            }
+
+            const userData = await response.json();
+            console.log(`OAuth connection successful. Connected as: ${userData.name}`);
+            return true;
+        } catch (error: any) {
+            console.error('OAuth connection test failed:', error.message);
+            return false;
         }
     }
 
@@ -188,6 +409,8 @@ export class RedditDownloader {
     private async findWorkingAudioUrl(audioUrls: string[], originalPostUrl: string): Promise<string | null> {
         console.log('Trying multiple audio sources...');
 
+        const authHeaders = await this.getAuthHeaders();
+
         for (const url of audioUrls) {
             try {
                 console.log(`Trying audio URL: ${url}`);
@@ -196,7 +419,7 @@ export class RedditDownloader {
                 const response = await fetch(url, {
                     method: 'HEAD',
                     headers: {
-                        'User-Agent': USER_AGENT,
+                        ...authHeaders,
                         'Referer': originalPostUrl,
                         'Origin': 'https://www.reddit.com'
                     },

@@ -24,9 +24,16 @@ class Controllder {
                 console.log('Processing as Reddit URL:', url);
 
                 // Create instance of RedditDownloader with the correct path
-                const redditDownloader = new RedditDownloader(path.join(__dirname));
+                const redditDownloader = new RedditDownloader(path.join(__dirname), {
+                    clientId: '',
+                    clientSecret: '',
+                    username: '',
+                    password: '',
+                });
 
                 try {
+                    await redditDownloader.testOAuthToken();
+
                     const videoInfo = await redditDownloader.downloadRedditVideo(url);
                     res.json(videoInfo);
                     return;
