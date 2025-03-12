@@ -163,7 +163,6 @@ export class RedditDownloader {
             const authHeaders = await this.getAuthHeaders();
             const response = await fetch(url, {
                 headers: {
-                    ...authHeaders,
                     'Referer': referer,
                     'Origin': 'https://www.reddit.com'
                 },
@@ -419,7 +418,6 @@ export class RedditDownloader {
                 const response = await fetch(url, {
                     method: 'HEAD',
                     headers: {
-                        ...authHeaders,
                         'Referer': originalPostUrl,
                         'Origin': 'https://www.reddit.com'
                     },
